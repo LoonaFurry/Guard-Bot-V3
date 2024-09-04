@@ -6,9 +6,11 @@ import datetime
 import re
 import emoji
 import aiohttp
+import os
 from dotenv import load_dotenv
-import logging
 from fuzzywuzzy import fuzz
+import unicodedata
+import logging
 
 # Setup logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,17 +30,21 @@ if not TOKEN or not VIRUSTOTAL_API_KEY:
 SLOW_MODE_DELAY = 5  # seconds
 DUPLICATE_RESET_TIME = 60  # seconds
 DUPLICATE_MSG_THRESHOLD = 3
-CAPITALIZATION_THRESHOLD = 0.5  # percentage
-SPAM_THRESHOLD = 2
+CAPITALIZATION_THRESHOLD = 0.7  # percentage
 SPAM_TIME = 1  # seconds
+SPAM_THRESHOLD = 4  # number of messages in SPAM_TIME seconds
 RAID_THRESHOLD = 10
 RAID_TIME = 300  # seconds
 EMOJI_THRESHOLD = 5  # maximum number of emojis allowed in a message
+WARNING_LIMIT = 1  # number of warnings before muting
+MUTE_DURATION_30S = 30  # seconds
+MUTE_DURATION_5M = 300  # seconds
 
 # Initialize bot
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True  # Required to track member joins
+intents.guilds = True  # Required to track guild roles
 bot = commands.Bot(command_prefix='/', intents=intents)
 
 # Tracking dictionaries
@@ -46,6 +52,21 @@ user_messages = defaultdict(lambda: deque(maxlen=SPAM_THRESHOLD))
 message_history = defaultdict(lambda: deque(maxlen=DUPLICATE_MSG_THRESHOLD))
 last_reset_time = defaultdict(lambda: datetime.datetime.now(datetime.timezone.utc))
 member_join_times = defaultdict(lambda: deque(maxlen=RAID_THRESHOLD))
+spam_warnings = defaultdict(int)  # Track number of warnings for each user
+muted_users = defaultdict(lambda: None)  # Track muted users
+
+def normalize_text(text):
+    """Normalize text by removing non-alphanumeric characters and converting to lowercase."""
+    text = re.sub(r'[^\w\s]', '', text)  # Remove punctuation
+    text = re.sub(r'\d+', '', text)      # Remove numbers
+    text = unicodedata.normalize('NFKC', text)  # Normalize Unicode characters
+    return text.lower()
+
+def is_similar(existing_message, new_message, threshold=90):
+    """Check if the new_message is similar to the existing_message based on the given threshold."""
+    existing_message_normalized = normalize_text(existing_message)
+    new_message_normalized = normalize_text(new_message)
+    return fuzz.ratio(existing_message_normalized, new_message_normalized) > threshold
 
 async def update_status():
     statuses = [
@@ -160,6 +181,23 @@ async def check_for_raid(guild):
             await guild.text_channels[0].send(WARN_MESSAGE)
             member_join_times[guild.id].clear()
 
+async def mute_user(member, duration):
+    mute_role = discord.utils.get(member.guild.roles, name="Muted")
+    if not mute_role:
+        logging.error("Mute role not found. Please create a role named 'Muted'.")
+        return
+
+    try:
+        await member.add_roles(mute_role)
+        logging.info(f"Muted {member.name} for {duration} seconds.")
+        await asyncio.sleep(duration)
+        await member.remove_roles(mute_role)
+        logging.info(f"Unmuted {member.name} after {duration} seconds.")
+    except discord.Forbidden:
+        logging.error(f"Failed to mute {member.name}.")
+    except Exception as e:
+        logging.error(f"Error muting {member.name}: {e}")
+
 @bot.event
 async def on_member_join(member):
     guild_id = member.guild.id
@@ -167,93 +205,105 @@ async def on_member_join(member):
 
     # Track join time for the guild
     member_join_times[guild_id].append(current_time)
-    await check_for_raid(member.guild)
     
+    # Check for raid
+    await check_for_raid(member.guild)
+
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # Handle excessive emojis
-    if contains_excessive_emojis(message.content):
-        await message.delete()
-        await message.channel.send(f"{message.author.mention}, your message contained too many emojis and has been deleted.", delete_after=10)
-        logging.debug(f"Deleted message due to excessive emojis: {message.content}")
-        return
-
-    # Handle excessive capitalization
-    if len(message.content) > 0 and (sum(1 for c in message.content if c.isupper()) / len(message.content)) >= CAPITALIZATION_THRESHOLD:
-        await message.delete()
-        await message.channel.send(f"{message.author.mention}, please avoid excessive capitalization.", delete_after=10)
-        logging.debug(f"Deleted message due to excessive capitalization: {message.content}")
-        return
-
-    # Handle duplicate and similar messages
     current_time = datetime.datetime.now(datetime.timezone.utc)
-    user_history = message_history[message.author.id]
+    user_message_deque = user_messages[message.author.id]
 
-    def is_similar(existing_message, new_message, threshold=90):
-        """Check if the new_message is similar to the existing_message based on the given threshold."""
-        return fuzz.ratio(existing_message, new_message) > threshold
+    # Spam detection: Delete the third message within one second
+    user_message_deque.append((message.content, current_time))
+    if len(user_message_deque) > SPAM_THRESHOLD:
+        time_diff = (current_time - user_message_deque[0][1]).total_seconds()
+        if time_diff <= SPAM_TIME:
+            if len(user_message_deque) >= SPAM_THRESHOLD:
+                await message.channel.send(f"{message.author.mention}, your message was deleted due to spam.")
+                await message.delete()
+                logging.warning(f"Deleted spam message from {message.author.name}.")
+                user_message_deque.popleft()  # Remove the oldest message after deletion
+        else:
+            user_message_deque.popleft()  # Remove old messages if outside the time window
 
-    # Check for duplicates or similar messages in the history
-    duplicate_detected = False
-    for msg in user_history:
-        if msg['content'] == message.content or is_similar(msg['content'], message.content):
-            duplicate_detected = True
-            break
-
-    if duplicate_detected:
-        # Only delete the message if it is a duplicate
-        if len(user_history) >= DUPLICATE_MSG_THRESHOLD - 1:
-            await message.delete()
-            await message.channel.send(f"{message.author.mention}, your duplicate or similar messages were detected and deleted.", delete_after=10)
-            logging.debug(f"Deleted message due to duplication or similarity: {message.content}")
-
-        # Add the message to history and clear it for this user
-        message_history[message.author.id].append({'content': message.content, 'timestamp': current_time})
+    # Slow mode: Check if user is sending messages too quickly
+    last_message_time = user_message_deque[0][1] if user_message_deque else current_time
+    if (current_time - last_message_time).total_seconds() < SLOW_MODE_DELAY:
+        await message.channel.send(f"{message.author.mention}, you are sending messages too quickly. Please wait a moment.")
+        await message.delete()
+        logging.warning(f"Deleted message from {message.author.name} due to slow mode.")
         return
 
-    # Add new message to history
-    user_history.append({'content': message.content, 'timestamp': current_time})
-
-    # Handle spamming
-    user_messages[message.author.id].append(current_time)
-    if len(user_messages[message.author.id]) == SPAM_THRESHOLD:
-        if (current_time - user_messages[message.author.id][0]).total_seconds() <= SPAM_TIME:
+    # Duplicate message detection
+    message_history[message.author.id].append(message.content)
+    if len(message_history[message.author.id]) >= DUPLICATE_MSG_THRESHOLD:
+        recent_messages = list(message_history[message.author.id])
+        if all(is_similar(recent_messages[-1], msg) for msg in recent_messages[:-1]):
+            await message.channel.send(f"{message.author.mention}, your message was deleted because it was a duplicate.")
             await message.delete()
-            await message.channel.send(f"{message.author.mention}, you are sending messages too quickly. Please slow down.", delete_after=10)
-            logging.debug(f"Deleted message due to spamming: {message.content}")
+            logging.warning(f"Deleted duplicate message from {message.author.name}.")
             return
 
-    # Handle suspicious links
+    # Excessive capitalization detection
+    if len(message.content) > 0:  # Avoid division by zero
+        capitalization_ratio = sum(char.isupper() for char in message.content) / len(message.content)
+        if capitalization_ratio > CAPITALIZATION_THRESHOLD:
+            await message.channel.send(f"{message.author.mention}, your message was deleted due to excessive capitalization.")
+            await message.delete()
+            logging.warning(f"Deleted message with excessive capitalization from {message.author.name}.")
+            return
+
+    # Emoji detection
+    if contains_excessive_emojis(message.content):
+        await message.channel.send(f"{message.author.mention}, your message was deleted due to excessive emojis.")
+        await message.delete()
+        logging.warning(f"Deleted message with excessive emojis from {message.author.name}.")
+        return
+
+    # Link detection
     if is_link(message.content):
-        if not await analyze_link_safety(message.content):
+        link = re.search(r'(https?://\S+)', message.content).group(0)
+        if not await analyze_link_safety(link):
+            await message.channel.send(f"{message.author.mention}, your message contained an unsafe link and has been deleted.")
             await message.delete()
-            await message.channel.send(f"{message.author.mention}, a suspicious link was detected and removed.", delete_after=10)
-            logging.debug(f"Deleted message due to suspicious link: {message.content}")
-            return
+            logging.warning(f"Deleted message with unsafe link from {message.author.name}.")
+        else:
+            await message.channel.send(f"{message.author.mention}, your message contained a safe link.")
+        return
 
-    # Handle file uploads
+    # File attachment safety
     if message.attachments:
         for attachment in message.attachments:
-            if not await analyze_file_safety(attachment.url):
-                await message.delete()
-                await message.channel.send(f"{message.author.mention}, a file you uploaded was flagged as malicious and has been deleted.", delete_after=10)
-                logging.debug(f"Deleted file upload due to safety concerns: {attachment.url}")
+            try:
+                file_url = attachment.url
+                if not await analyze_file_safety(file_url):
+                    await message.channel.send(f"{message.author.mention}, your message contained an unsafe file and has been deleted.")
+                    await message.delete()
+                    logging.warning(f"Deleted message with unsafe file from {message.author.name}.")
+                else:
+                    await message.channel.send(f"{message.author.mention}, your message contained a safe file.")
+            except Exception as e:
+                logging.error(f"Error analyzing file attachment: {e}")
                 return
 
-@bot.event
-async def on_message_edit(before, after):
-    if before.author.bot:
-        return
+    # Handle warnings for spamming
+    if message.author.id in spam_warnings:
+        if spam_warnings[message.author.id] >= WARNING_LIMIT:
+            await mute_user(message.author, MUTE_DURATION_5M)
+            spam_warnings[message.author.id] = 0  # Reset warnings after muting
+        else:
+            spam_warnings[message.author.id] += 1
 
-    if before.content != after.content:
-        logging.info(f"Message edited from: '{before.content}' to: '{after.content}'")
+    # Process commands and other messages
+    await bot.process_commands(message)
 
 @bot.event
 async def on_ready():
-    logging.info(f'Bot is ready. Logged in as {bot.user.name}')
+    logging.info(f'Logged in as {bot.user.name}')
     bot.loop.create_task(update_status())
 
 bot.run(TOKEN)
