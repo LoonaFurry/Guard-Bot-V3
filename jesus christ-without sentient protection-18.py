@@ -6,7 +6,6 @@ import datetime
 import re
 import emoji
 import aiohttp
-import os
 from dotenv import load_dotenv
 from fuzzywuzzy import fuzz
 import unicodedata
