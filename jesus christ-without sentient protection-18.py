@@ -223,19 +223,23 @@ async def on_message(message):
         time_diff = (current_time - user_message_deque[0][1]).total_seconds()
         if time_diff <= SPAM_TIME:
             if len(user_message_deque) >= SPAM_THRESHOLD:
-                await message.channel.send(f"{message.author.mention}, your message was deleted due to spam.")
+                warning_message = await message.channel.send(f"{message.author.mention}, your message was deleted due to spam.")
                 await message.delete()
                 logging.warning(f"Deleted spam message from {message.author.name}.")
                 user_message_deque.popleft()  # Remove the oldest message after deletion
+                await asyncio.sleep(10)  # Wait for 10 seconds before deleting the warning message
+                await warning_message.delete()  # Delete the warning message
         else:
             user_message_deque.popleft()  # Remove old messages if outside the time window
 
     # Slow mode: Check if user is sending messages too quickly
     last_message_time = user_message_deque[0][1] if user_message_deque else current_time
     if (current_time - last_message_time).total_seconds() < SLOW_MODE_DELAY:
-        await message.channel.send(f"{message.author.mention}, you are sending messages too quickly. Please wait a moment.")
+        warning_message = await message.channel.send(f"{message.author.mention}, you are sending messages too quickly. Please wait a moment.")
         await message.delete()
         logging.warning(f"Deleted message from {message.author.name} due to slow mode.")
+        await asyncio.sleep(10)  # Wait for 10 seconds before deleting the warning message
+        await warning_message.delete()  # Delete the warning message
         return
 
     # Duplicate message detection
@@ -243,34 +247,42 @@ async def on_message(message):
     if len(message_history[message.author.id]) >= DUPLICATE_MSG_THRESHOLD:
         recent_messages = list(message_history[message.author.id])
         if all(is_similar(recent_messages[-1], msg) for msg in recent_messages[:-1]):
-            await message.channel.send(f"{message.author.mention}, your message was deleted because it was a duplicate.")
+            warning_message = await message.channel.send(f"{message.author.mention}, your message was deleted because it was a duplicate.")
             await message.delete()
             logging.warning(f"Deleted duplicate message from {message.author.name}.")
+            await asyncio.sleep(10)  # Wait for 10 seconds before deleting the warning message
+            await warning_message.delete()  # Delete the warning message
             return
 
     # Excessive capitalization detection
     if len(message.content) > 0:  # Avoid division by zero
         capitalization_ratio = sum(char.isupper() for char in message.content) / len(message.content)
         if capitalization_ratio > CAPITALIZATION_THRESHOLD:
-            await message.channel.send(f"{message.author.mention}, your message was deleted due to excessive capitalization.")
+            warning_message = await message.channel.send(f"{message.author.mention}, your message was deleted due to excessive capitalization.")
             await message.delete()
             logging.warning(f"Deleted message with excessive capitalization from {message.author.name}.")
+            await asyncio.sleep(10)  # Wait for 10 seconds before deleting the warning message
+            await warning_message.delete()  # Delete the warning message
             return
 
     # Emoji detection
     if contains_excessive_emojis(message.content):
-        await message.channel.send(f"{message.author.mention}, your message was deleted due to excessive emojis.")
+        warning_message = await message.channel.send(f"{message.author.mention}, your message was deleted due to excessive emojis.")
         await message.delete()
         logging.warning(f"Deleted message with excessive emojis from {message.author.name}.")
+        await asyncio.sleep(10)  # Wait for 10 seconds before deleting the warning message
+        await warning_message.delete()  # Delete the warning message
         return
 
     # Link detection
     if is_link(message.content):
         link = re.search(r'(https?://\S+)', message.content).group(0)
         if not await analyze_link_safety(link):
-            await message.channel.send(f"{message.author.mention}, your message contained an unsafe link and has been deleted.")
+            warning_message = await message.channel.send(f"{message.author.mention}, your message contained an unsafe link and has been deleted.")
             await message.delete()
             logging.warning(f"Deleted message with unsafe link from {message.author.name}.")
+            await asyncio.sleep(10)  # Wait for 10 seconds before deleting the warning message
+            await warning_message.delete()  # Delete the warning message
         else:
             await message.channel.send(f"{message.author.mention}, your message contained a safe link.")
         return
@@ -281,9 +293,11 @@ async def on_message(message):
             try:
                 file_url = attachment.url
                 if not await analyze_file_safety(file_url):
-                    await message.channel.send(f"{message.author.mention}, your message contained an unsafe file and has been deleted.")
+                    warning_message = await message.channel.send(f"{message.author.mention}, your message contained an unsafe file and has been deleted.")
                     await message.delete()
                     logging.warning(f"Deleted message with unsafe file from {message.author.name}.")
+                    await asyncio.sleep(10)  # Wait for 10 seconds before deleting the warning message
+                    await warning_message.delete()  # Delete the warning message
                 else:
                     await message.channel.send(f"{message.author.mention}, your message contained a safe file.")
             except Exception as e:
@@ -300,6 +314,7 @@ async def on_message(message):
 
     # Process commands and other messages
     await bot.process_commands(message)
+
 
 @bot.event
 async def on_ready():
